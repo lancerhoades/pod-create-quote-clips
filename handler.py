@@ -3,7 +3,7 @@ from typing import Dict, Any, Optional
 import runpod
 from utils import ensure_dir, download_to, load_clips_from_json, run_ffmpeg_subclip
 
-STORAGE_ROOT = "/storage"  # RunPod network storage mount
+STORAGE_ROOT = "/runpod-volume"  # RunPod network storage mount
 
 def default_paths(job_id: str):
     base = os.path.join(STORAGE_ROOT, job_id)
@@ -24,7 +24,7 @@ def extract_clips(
     reextract: bool = False
 ) -> Dict[str, Any]:
     """
-    Produces subclips under /storage/{job_id}/clips/*.mp4
+    Produces subclips under /runpod-volume/{job_id}/clips/*.mp4
     """
     if not job_id:
         raise RuntimeError("job_id is required.")

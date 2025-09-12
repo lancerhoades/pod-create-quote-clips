@@ -3,11 +3,11 @@
 RunPod Serverless worker that cuts quote clips from a split sermon video.
 
 ## Inputs (event.input)
-- job_id (string, required): job identifier; files live under /storage/{job_id}
+- job_id (string, required): job identifier; files live under /runpod-volume/{job_id}
 - input_mode (string, optional): "storage" (default) or "url"
-- input_video_local (string, optional): absolute path, e.g. /storage/{job_id}/splits/sermon.mp4
+- input_video_local (string, optional): absolute path, e.g. /runpod-volume/{job_id}/splits/sermon.mp4
 - input_video_url (string, optional): presigned URL for the input video
-- clips_json_local (string, optional): defaults to /storage/{job_id}/clips/clips.json
+- clips_json_local (string, optional): defaults to /runpod-volume/{job_id}/clips/clips.json
 - clips_json_url (string, optional): URL to clip metadata JSON
 - reextract (bool, optional): overwrite existing outputs (default false)
 
@@ -18,7 +18,7 @@ Returns JSON with:
 - stdout: summary message
 
 ## Storage Layout Used
-/storage/
+/runpod-volume/
   └── {job_id}/
        ├── splits/
        │    └── sermon.mp4
