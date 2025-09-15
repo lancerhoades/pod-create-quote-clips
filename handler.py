@@ -1,6 +1,7 @@
 import os, json, traceback
 from typing import Dict, Any, Optional
 import runpod
+VOLUME_PATH = os.getenv("RUNPOD_VOLUME_PATH", "/runpod-volume")
 from utils import ensure_dir, download_to, load_clips_from_json, run_ffmpeg_subclip
 
 STORAGE_ROOT = "/runpod-volume"  # RunPod network storage mount
