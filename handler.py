@@ -88,6 +88,7 @@ async def load_clips_config(job_id: str, clips_json_url: Optional[str]) -> List[
     else:
         raise ValueError("clips.json must be a list or an object with a 'clips' key")
 
+    log.info(f"Loaded {len(clips)} clip windows from clips.json");
     norm = []
     for idx, c in enumerate(clips, start=1):
         start_s = c.get("start") or c.get("start_s") or c.get("from")
@@ -105,7 +106,7 @@ async def load_clips_config(job_id: str, clips_json_url: Optional[str]) -> List[
         raise ValueError("No valid clips found in clips.json")
     return norm
 
-def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     """
     input:
       job_id (str) REQUIRED
@@ -130,11 +131,11 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         clips_json_url = data.get("clips_json_url")
 
         # load clips windows
-        windows = asyncio.run(load_clips_config(job_id, clips_json_url))
+        windows = await load_clips_config(job_id, clips_json_url)
 
         # get source locally
         if video_url:
-            src_local = asyncio.run(ensure_local_video(video_url))
+            src_local = await ensure_local_video(video_url)
         elif video_path:
             src_local = video_path
         else:
