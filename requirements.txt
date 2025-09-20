@@ -1,2 +1,5 @@
-runpod>=1.6.1
-requests>=2.32.3
+runpod
+boto3
+botocore
+aiohttp
+requests
