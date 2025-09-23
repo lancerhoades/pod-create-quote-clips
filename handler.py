@@ -4,13 +4,16 @@ import boto3
 from botocore.client import Config
 import runpod
 
+# ----------------------- ENV / Logging -----------------------
 AWS_REGION     = os.getenv("AWS_REGION", "us-east-1")
 AWS_S3_BUCKET  = os.getenv("AWS_S3_BUCKET")
 S3_PREFIX_BASE = os.getenv("S3_PREFIX_BASE", "jobs")
 LOG_LEVEL      = os.getenv("LOG_LEVEL","INFO").upper()
 
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
-                    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
 log = logging.getLogger("pod-create-quote-clips")
 
 if not AWS_S3_BUCKET:
@@ -18,6 +21,7 @@ if not AWS_S3_BUCKET:
 
 s3 = boto3.client("s3", region_name=AWS_REGION, config=Config(s3={"addressing_style":"virtual"}))
 
+# ----------------------- Helpers -----------------------
 def s3_key(job_id: str, *parts: str) -> str:
     safe = [p.strip("/").replace("\\","/") for p in parts if p]
     return "/".join([S3_PREFIX_BASE.strip("/"), job_id] + safe)
@@ -36,39 +40,48 @@ async def http_download(url: str, dst: str):
                     f.write(chunk)
 
 def slugify(text: str, maxlen: int = 40) -> str:
-    text = re.sub(r"[^a-zA-Z0-9\-_.]+", "-", (text or "").strip())
+    text = re.sub(r"[^a-zA-Z0-9\\-_.]+", "-", (text or "").strip())
     text = re.sub(r"-{2,}", "-", text).strip("-")
     return (text[:maxlen] or "clip").lower()
 
-def ffmpeg_subclip(src: str, dst: str, start_s: float, end_s: float):
+def ffmpeg_subclip_url_aware(src_url_or_path: str, dst: str, start_s: float, end_s: float):
+    """Use -ss before -i so ffmpeg can input-seek even over HTTP (range)."""
     duration = max(0.01, float(end_s) - float(start_s))
     cmd = [
         "ffmpeg","-hide_banner","-y",
         "-ss", f"{start_s:.3f}",
-        "-i", src,
+        "-i", src_url_or_path,
         "-t", f"{duration:.3f}",
         "-c:v","libx264","-preset","veryfast","-crf","23",
         "-c:a","aac","-b:a","160k",
         dst
     ]
+    log.info("FFmpeg: %s", " ".join(cmd))
     subprocess.check_call(cmd)
 
-async def ensure_local_video(url_or_path: str) -> str:
-    if url_or_path.startswith("http"):
-        tmp = os.path.join(tempfile.gettempdir(), f"input-{uuid.uuid4().hex}.mp4")
-        await http_download(url_or_path, tmp)
-        return tmp
-    if url_or_path.startswith("s3://"):
-        # s3://bucket/key → presign then download
-        _, _, rest = url_or_path.partition("s3://")
-        bucket, _, key = rest.partition("/")
-        tmp = os.path.join(tempfile.gettempdir(), f"input-{uuid.uuid4().hex}.mp4")
-        url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=3600)
-        await http_download(url, tmp)
-        return tmp
-    return url_or_path  # assume local path
+def materialize_source_if_needed(video_url: Optional[str], video_path: Optional[str]) -> str:
+    """
+    Return a source string usable by ffmpeg:
+      - http(s) URL: returned as-is
+      - s3://bucket/key: converted to presigned URL
+      - local path: returned as-is
+    """
+    if video_url:
+        if video_url.startswith("s3://"):
+            _, _, rest = video_url.partition("s3://")
+            bkt, _, key = rest.partition("/")
+            return presign(bkt or AWS_S3_BUCKET, key, 3600)
+        return video_url
+    if video_path:
+        if video_path.startswith("s3://"):
+            _, _, rest = video_path.partition("s3://")
+            bkt, _, key = rest.partition("/")
+            return presign(bkt or AWS_S3_BUCKET, key, 3600)
+        return video_path
+    raise ValueError("Provide video_url (preferred) or video_path")
 
 async def load_clips_config(job_id: str, clips_json_url: Optional[str]) -> List[Dict[str, Any]]:
+    """Load and normalize the clip windows from clips.json (http or s3 default)."""
     if clips_json_url and clips_json_url.startswith("http"):
         tmp = os.path.join(tempfile.gettempdir(), f"clips-{uuid.uuid4().hex}.json")
         await http_download(clips_json_url, tmp)
@@ -88,13 +101,12 @@ async def load_clips_config(job_id: str, clips_json_url: Optional[str]) -> List[
     else:
         raise ValueError("clips.json must be a list or an object with a 'clips' key")
 
-    log.info(f"Loaded {len(clips)} clip windows from clips.json");
-    norm = []
+    log.info(f"Loaded {len(clips)} clip windows from clips.json")
+    norm: List[Dict[str, Any]] = []
     for idx, c in enumerate(clips, start=1):
         start_s = c.get("start") or c.get("start_s") or c.get("from")
         end_s   = c.get("end")   or c.get("end_s")   or c.get("to")
         if start_s is None or end_s is None:
-            # allow duration instead of end
             dur = c.get("duration")
             if start_s is not None and dur is not None:
                 end_s = float(start_s) + float(dur)
@@ -106,16 +118,81 @@ async def load_clips_config(job_id: str, clips_json_url: Optional[str]) -> List[
         raise ValueError("No valid clips found in clips.json")
     return norm
 
+def pick_single_window(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    If caller intends single-clip mode, return a single normalized window:
+      - prefer 'restrict_to_window': {start,end,title?}
+      - else start/end (or start+duration)
+      - optional 'title'
+    """
+    if "restrict_to_window" in data and isinstance(data["restrict_to_window"], dict):
+        rw = data["restrict_to_window"]
+        st = rw.get("start"); en = rw.get("end")
+        if st is not None and en is not None:
+            return {"idx": 1, "title": rw.get("title") or data.get("title") or "clip",
+                    "start": float(st), "end": float(en)}
+
+    st = data.get("start"); en = data.get("end"); dur = data.get("duration")
+    if st is not None and (en is not None or dur is not None):
+        if en is None:
+            en = float(st) + float(dur)
+        return {"idx": 1, "title": data.get("title") or "clip",
+                "start": float(st), "end": float(en)}
+    return None
+
+def make_compat_payload(url: str, key: str, s3_uri: str, clip_item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Provide multiple shapes so older callers can find the URL:
+      - top-level 'url'
+      - 'output': {'url': ...}
+      - 'urls': {'url': ..., 'mp4_url': ..., 'clips': [{'url': ...}]}
+      - 'clip': single item
+      - 'clips': [item]
+    """
+    item = {
+        "index": clip_item.get("index", 1),
+        "title": clip_item.get("title"),
+        "start": clip_item.get("start"),
+        "end": clip_item.get("end"),
+        "key": key,
+        "url": url,
+        "s3_uri": s3_uri
+    }
+    return {
+        "ok": True,
+        "url": url,                         # <- simple path for clients that expect single url
+        "output": {"url": url, "key": key, "s3_uri": s3_uri},
+        "urls": {"url": url, "mp4_url": url, "clips": [ {"url": url} ]},
+        "clip": item,
+        "clips": [item]
+    }
+
+# ----------------------- Handler -----------------------
 async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     """
-    input:
-      job_id (str) REQUIRED
-      video_url (str) PREFERRED  (or input_video_url)
-      video_path (str) optional  (legacy)
-      clips_json_url (str) optional; default: s3://$BUCKET/jobs/{job_id}/clips/clips.json
+    INPUT (single-clip mode):
+      job_id (str)            REQUIRED
+      video_url (str)         PREFERRED (http or s3://)
+      video_path (str)        optional (local or s3://)
+      start (float)           REQUIRED in single-clip OR restrict_to_window.start
+      end (float)             REQUIRED in single-clip OR use duration
+      duration (float)        optional (if end omitted)
+      title (str)             optional
+      restrict_to_window (dict{start,end,title?}) optional
+      single_clip/no_batch    optional flags (truthy -> single-clip)
+      output_basename (str)   optional, filename without path (e.g., 'clip_01.mp4')
 
-    output:
-      { ok, job_id, clips: [ {index,title,start,end,key,url,s3_uri}, ... ] }
+    INPUT (batch / backwards-compatible):
+      job_id (str)            REQUIRED
+      video_url/video_path    see above
+      clips_json_url (str)    optional; defaults to s3://$BUCKET/jobs/{job_id}/clips/clips.json
+
+    OUTPUT (single-clip):
+      { ok, url, output{url,key,s3_uri}, urls{url,mp4_url,clips:[{url}]}, clip{...}, clips:[{...}] }
+
+    OUTPUT (batch):
+      { ok, job_id, clips: [ {index,title,start,end,key,url,s3_uri}, ... ],
+        urls: { clips: [ <url>, ... ] } }
     """
     try:
         data = event.get("input", {}) if isinstance(event, dict) else {}
@@ -123,43 +200,71 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         if not job_id:
             return {"error": "job_id is required"}
 
-        # source video
+        # Source selection (prefer URL; support s3:// and local)
         video_url = data.get("video_url") or data.get("input_video_url")
         video_path = data.get("video_path") or data.get("input_video_local")
+        src = materialize_source_if_needed(video_url, video_path)
 
-        # clips metadata
+        # Decide single-clip vs batch
+        single_window = pick_single_window(data)
+        single_forced = bool(data.get("single_clip") or data.get("no_batch"))
+        single_mode = bool(single_window or single_forced)
+
+        # ---------------- Single-clip Mode ----------------
+        if single_mode:
+            if not single_window:
+                return {"error": "single-clip mode requested but no start/end (or duration) provided."}
+
+            output_basename = (data.get("output_basename") or "").strip()
+            title = single_window.get("title") or data.get("title") or "clip"
+            base_noext = output_basename.rsplit(".", 1)[0] if output_basename else slugify(title)
+            dst_local = os.path.join(tempfile.gettempdir(), f"{base_noext}.mp4")
+
+            start_s = float(single_window["start"])
+            end_s   = float(single_window["end"])
+            log.info(f"[single] {job_id} {start_s:.3f}-{end_s:.3f} → {base_noext}.mp4")
+
+            ffmpeg_subclip_url_aware(src, dst_local, start_s, end_s)
+
+            key = s3_key(job_id, "clips", f"{base_noext}.mp4")
+            s3.upload_file(dst_local, AWS_S3_BUCKET, key)
+            url = presign(AWS_S3_BUCKET, key)
+            s3_uri = f"s3://{AWS_S3_BUCKET}/{key}"
+
+            payload = make_compat_payload(url, key, s3_uri, {
+                "index": 1, "title": title, "start": start_s, "end": end_s
+            })
+            payload["job_id"] = job_id
+            return payload
+
+        # ---------------- Batch Mode (backwards-compatible) ----------------
         clips_json_url = data.get("clips_json_url")
-
-        # load clips windows
         windows = await load_clips_config(job_id, clips_json_url)
 
-        # get source locally
-        if video_url:
-            src_local = await ensure_local_video(video_url)
-        elif video_path:
-            src_local = video_path
-        else:
-            return {"error": "Provide video_url (preferred) or video_path."}
-
-        out_items = []
+        out_items: List[Dict[str, Any]] = []
+        url_list: List[str] = []
         for w in windows:
             idx = w["idx"]
             title = w["title"]
             start_s = w["start"]; end_s = w["end"]
             slug = slugify(title) if title else f"clip-{idx:03d}"
             dst_local = os.path.join(tempfile.gettempdir(), f"{slug}-{idx:03d}.mp4")
-            ffmpeg_subclip(src_local, dst_local, start_s, end_s)
+
+            log.info(f"[batch] {job_id} [{idx}] {start_s:.3f}-{end_s:.3f} → {slug}-{idx:03d}.mp4")
+            ffmpeg_subclip_url_aware(src, dst_local, start_s, end_s)
 
             key = s3_key(job_id, "clips", f"{slug}-{idx:03d}.mp4")
             s3.upload_file(dst_local, AWS_S3_BUCKET, key)
             url = presign(AWS_S3_BUCKET, key)
+            url_list.append(url)
 
             out_items.append({
                 "index": idx, "title": title, "start": start_s, "end": end_s,
                 "key": key, "url": url, "s3_uri": f"s3://{AWS_S3_BUCKET}/{key}"
             })
 
-        return {"ok": True, "job_id": job_id, "clips": out_items}
+        # Include a compatibility 'urls.clips' list of strings for older parsers
+        return {"ok": True, "job_id": job_id, "clips": out_items, "urls": {"clips": url_list}}
 
     except subprocess.CalledProcessError as e:
         return {"error": f"ffmpeg failed: {e}"}
@@ -167,4 +272,5 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         log.exception("handler failed")
         return {"error": str(e)}
 
+# Runpod entrypoint
 runpod.serverless.start({"handler": handler})
