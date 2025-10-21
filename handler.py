@@ -160,12 +160,30 @@ def make_compat_payload(url: str, key: str, s3_uri: str, clip_item: Dict[str, An
     }
     return {
         "ok": True,
-        "url": url,                         # <- simple path for clients that expect single url
+        "url": url,
         "output": {"url": url, "key": key, "s3_uri": s3_uri},
         "urls": {"url": url, "mp4_url": url, "clips": [ {"url": url} ]},
         "clip": item,
         "clips": [item]
     }
+
+# ---- NEW: probe duration & tiny-file helpers ----
+def probe_duration(src: str) -> Optional[float]:
+    try:
+        out = subprocess.check_output(
+            ["ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1", src],
+            stderr=subprocess.STDOUT, text=True
+        ).strip()
+        return float(out)
+    except Exception as e:
+        log.warning("probe_duration failed for %s: %s", src, e)
+        return None
+
+def _tiny_file(path: str, min_bytes: int = 100*1024) -> bool:
+    try:
+        return os.path.getsize(path) < min_bytes
+    except Exception:
+        return True
 
 # ----------------------- Handler -----------------------
 async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -181,18 +199,14 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
       restrict_to_window (dict{start,end,title?}) optional
       single_clip/no_batch    optional flags (truthy -> single-clip)
       output_basename (str)   optional, filename without path (e.g., 'clip_01.mp4')
+      fallback_full_url (str) optional HTTP URL to full recording for auto-retry
 
     INPUT (batch / backwards-compatible):
       job_id (str)            REQUIRED
       video_url/video_path    see above
       clips_json_url (str)    optional; defaults to s3://$BUCKET/jobs/{job_id}/clips/clips.json
 
-    OUTPUT (single-clip):
-      { ok, url, output{url,key,s3_uri}, urls{url,mp4_url,clips:[{url}]}, clip{...}, clips:[{...}] }
-
-    OUTPUT (batch):
-      { ok, job_id, clips: [ {index,title,start,end,key,url,s3_uri}, ... ],
-        urls: { clips: [ <url>, ... ] } }
+    OUTPUT as before.
     """
     try:
         data = event.get("input", {}) if isinstance(event, dict) else {}
@@ -200,10 +214,26 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         if not job_id:
             return {"error": "job_id is required"}
 
-        # Source selection (prefer URL; support s3:// and local)
+        # Source selection & optional fallback
         video_url = data.get("video_url") or data.get("input_video_url")
         video_path = data.get("video_path") or data.get("input_video_local")
-        src = materialize_source_if_needed(video_url, video_path)
+        fallback_full_url = data.get("fallback_full_url") or data.get("full_url")
+
+        def choose_src_for_window(start_s: float, end_s: float) -> str:
+            """Prefer section src; if end exceeds section duration, use fallback full URL."""
+            section_src = materialize_source_if_needed(video_url, video_path)
+            dur = probe_duration(section_src)
+            if dur is not None and end_s > (dur - 0.25) and isinstance(fallback_full_url, str) and fallback_full_url.startswith("http"):
+                log.info("Window %.2f–%.2f exceeds section duration %.2f; switching to fallback_full_url", start_s, end_s, dur)
+                return fallback_full_url
+            return section_src
+
+        def cut_with_auto_retry(src: str, dst_local: str, start_s: float, end_s: float) -> None:
+            """Cut; if result looks tiny and we have a fallback, retry once with fallback_full_url."""
+            ffmpeg_subclip_url_aware(src, dst_local, start_s, end_s)
+            if _tiny_file(dst_local) and isinstance(fallback_full_url, str) and fallback_full_url.startswith("http") and src != fallback_full_url:
+                log.warning("Produced tiny file (%s). Retrying against fallback_full_url", dst_local)
+                ffmpeg_subclip_url_aware(fallback_full_url, dst_local, start_s, end_s)
 
         # Decide single-clip vs batch
         single_window = pick_single_window(data)
@@ -224,7 +254,8 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             end_s   = float(single_window["end"])
             log.info(f"[single] {job_id} {start_s:.3f}-{end_s:.3f} → {base_noext}.mp4")
 
-            ffmpeg_subclip_url_aware(src, dst_local, start_s, end_s)
+            src = choose_src_for_window(start_s, end_s)
+            cut_with_auto_retry(src, dst_local, start_s, end_s)
 
             key = s3_key(job_id, "clips", f"{base_noext}.mp4")
             s3.upload_file(dst_local, AWS_S3_BUCKET, key)
@@ -237,7 +268,7 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             payload["job_id"] = job_id
             return payload
 
-        # ---------------- Batch Mode (backwards-compatible) ----------------
+        # ---------------- Batch Mode ----------------
         clips_json_url = data.get("clips_json_url")
         windows = await load_clips_config(job_id, clips_json_url)
 
@@ -251,7 +282,9 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             dst_local = os.path.join(tempfile.gettempdir(), f"{slug}-{idx:03d}.mp4")
 
             log.info(f"[batch] {job_id} [{idx}] {start_s:.3f}-{end_s:.3f} → {slug}-{idx:03d}.mp4")
-            ffmpeg_subclip_url_aware(src, dst_local, start_s, end_s)
+
+            src = choose_src_for_window(start_s, end_s)
+            cut_with_auto_retry(src, dst_local, start_s, end_s)
 
             key = s3_key(job_id, "clips", f"{slug}-{idx:03d}.mp4")
             s3.upload_file(dst_local, AWS_S3_BUCKET, key)
@@ -263,7 +296,6 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
                 "key": key, "url": url, "s3_uri": f"s3://{AWS_S3_BUCKET}/{key}"
             })
 
-        # Include a compatibility 'urls.clips' list of strings for older parsers
         return {"ok": True, "job_id": job_id, "clips": out_items, "urls": {"clips": url_list}}
 
     except subprocess.CalledProcessError as e:
